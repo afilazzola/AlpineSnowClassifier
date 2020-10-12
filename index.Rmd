@@ -1,0 +1,202 @@
+---
+title: A tool for estimating snow cover from alpine meadows using high resolution
+  imagery and random forest
+author: "Alessandro Filazzola, Jens Roland, and Stephen F. Matter"
+date: "10/12/2020"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+  pdf_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+
+### Load Libraries and Images
+```{r warning=FALSE, message=FALSE}
+## Libraries
+library(raster)
+library(rgdal)
+library(rgeos)
+library(randomForest)
+library(dismo)
+
+## Load snow image
+snow <- brick("images//JumpingPound2012.tif")
+plotRGB(snow, stretch = "lin")
+
+## Load meadows
+meadows <- readOGR("data//shapeFile//meadowOutline.shp")
+
+## reproject meadows to be same CRS as raster
+meadows <- spTransform(meadows, crs(snow))
+
+
+## create butter around meadows to capture entire area
+# plot(meadows)
+buffMeadow <- gBuffer(meadows, byid=T,  width=10)
+plot(buffMeadow)
+plot(meadows, add=T)
+
+## Convert meadow names to characters
+buffMeadow$meadow <- as.character(buffMeadow$meadow)
+buffMeadow$meadow[buffMeadow$meadow=="g"] <- "littleg"
+meadowList <- buffMeadow$meadow
+meadowList <- meadowList[!meadowList %in% c("E","D","C")] ## drop Lusk
+```
+
+### Example of classifying an individual pixel as snow, forest, rock/bare ground
+```{r}
+
+## Extract a meadow
+i=1 ## meadow Z
+meadowList[i]
+snowMeadow <- crop(snow, buffMeadow[buffMeadow$meadow == meadowList[i],])
+snowMeadow <- mask(snowMeadow, buffMeadow[buffMeadow$meadow == meadowList[i],])
+
+
+
+## Place 100 random samples to classify
+set.seed(11)
+spTrain <- sampleRandom(snowMeadow, 100, sp=T)
+
+## Plot locations of pixel
+plotRGB(snowMeadow, stretch = "lin")
+text(x=coordinates(spTrain)[,1], y=coordinates(spTrain)[,2], labels=1:100)
+
+## Zoom in on a single pixel to classify
+j = 1
+range = 30 ## range of plot in metres
+
+plotRGB(crop(snowMeadow, extent(
+  coordinates(spTrain)[j,1]-range,  ## xmin
+  coordinates(spTrain)[j,1]+range,  ## xmax
+  coordinates(spTrain)[j,2]-range,  ## ymin
+  coordinates(spTrain)[j,2]+range)))  ## ymax
+plot(spTrain[j,], add=T)
+## Create datatable based on classifications
+```
+
+### Apply classified data using Random Forest
+```{r}
+### Load classified data
+meadowFiles <- list.files("data//snowClass//", pattern=".csv", full.names=T)
+trainData <- data.frame()
+for(i in 1:length(meadowFiles)){
+  temp <- read.table(meadowFiles[i],  header=T, sep=",")
+  trainData <- rbind(trainData, temp)
+}
+
+## Conduct random forest on RGB values
+rf1 <- randomForest(class ~ JumpingPound2012.1 + JumpingPound2012.2 + JumpingPound2012.3, data=trainData)
+rf1
+
+## Predict the land cover based on random forest
+landCover <- predict(snowMeadow, rf1)
+
+## Plot output with map
+par(mfrow=c(1,2))
+plotRGB(snowMeadow)
+plot(landCover, col=c("green","grey50","white"))
+
+## Determine percent cover of snow
+length(landCover[landCover==3])/sum(
+length(landCover[landCover==2]),
+length(landCover[landCover==3]))
+
+
+### Model validation for snow
+
+## create snow vs no snow
+trainData[,"snowPA"] <- ifelse(trainData$class=="snow",1,0)
+colnames(trainData)[3:5] <- c("Red","Green","Blue") ## revise names to RGB
+
+ ## withhold 20% for sample testing
+pres <- trainData[trainData$snowPA==1,]
+abs <- trainData[trainData$snowPA==0,]
+fold.p <- kfold(pres, k=5)
+occtest.p <- pres[fold.p == 4, ]
+occtrain.p <- pres[fold.p != 4, ]
+fold.a <- kfold(abs, k=5)
+occtest.a <-abs[fold.a == 4, ]
+occtrain.a <- abs[fold.a != 4, ]
+    
+## Combine training
+trainAll <- rbind(occtrain.p,occtrain.a)
+testAll <- rbind(occtest.p,occtest.a)
+
+## Evaluate the random forest
+rf1 <- randomForest(snowPA ~ Red + Green + Blue, data=trainAll, importance=T)
+rf1
+varImpPlot(rf1)
+
+eval1 <- evaluate(occtest.p, occtest.a, rf1)
+eval1
+eval1@pcor
+
+## Determine threshold value
+specSens <- threshold(eval1, stat="spec_sens")
+specSens
+
+## confusion matrix
+predictTest <- ifelse(predict(rf1, newdata =testAll)>specSens, 1,0)
+
+conTable <- table(predicted = predictTest, observed = testAll$snowPA)
+conTable
+accuracy <- sum(diag(conTable))/nrow(testAll)
+accuracy
+
+
+### Add in HSV values to models
+
+### Convert additional HSV
+rgbTohsv <- function(x){
+  r <- values(x[[1]])
+  g <- values(x[[2]])
+  b <- values(x[[2]])
+  hsv <- data.frame(t(rgb2hsv(r, g, b)))
+  return(hsv)
+}
+snow2 <- rgbTohsv(snow)
+hsvSnow <- snow
+hsvSnow[[1]] <- snow2[,"h"]
+hsvSnow[[2]] <- snow2[,"s"]
+hsvSnow[[3]] <- snow2[,"v"]
+hsvSnow
+
+coordinates(trainData) <- ~x+y
+crs(trainData) <- crs(snow)
+
+## Extract HSV values
+hsvValues <- extract(hsvSnow, trainData)
+rgbhsv <- cbind(trainData, hsvValues)
+names(rgbhsv) <- c("R","G","B","Class","snowPA","H","S","V")
+
+# write.csv(rgbhsv, "data//Classifiedrgbhsv.csv", row.names=FALSE)
+
+## New random forest
+rf2 <- randomForest(Class ~ R + G + B + H + S + V, data=rgbhsv, importance=T)
+rf2
+
+## Select submeadow 
+bothRas <- stack(snow, hsvSnow)
+names(bothRas) <- c("R","G","B","H","S","V")
+i <- 3
+meadowList[i]
+snowMeadow2 <- crop(bothRas, buffMeadow[buffMeadow$meadow == meadowList[i],])
+snowMeadow2 <- mask(snowMeadow2, buffMeadow[buffMeadow$meadow == meadowList[i],])
+
+
+## Predict the land cover based on random forest
+landCover <- predict(snowMeadow2, rf2)
+
+## Plot output with map
+par(mfrow=c(1,2))
+plotRGB(snowMeadow2)
+plot(landCover, col=c("green","grey50","white"))
+```
+

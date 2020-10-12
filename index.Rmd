@@ -24,6 +24,10 @@ library(rgdal)
 library(rgeos)
 library(randomForest)
 library(dismo)
+library(tidyverse)
+
+## load functions
+source("functions.r")
 
 ## Load snow image
 snow <- brick("images//JumpingPound2012.tif")
@@ -50,7 +54,7 @@ meadowList <- meadowList[!meadowList %in% c("E","D","C")] ## drop Lusk
 ```
 
 ### Example of classifying an individual pixel as snow, forest, rock/bare ground
-```{r}
+```{r warning=FALSE, message=FALSE}
 
 ## Extract a meadow
 i=1 ## meadow Z
@@ -82,7 +86,7 @@ plot(spTrain[j,], add=T)
 ```
 
 ### Apply classified data using Random Forest
-```{r}
+```{r warning=FALSE, message=FALSE}
 ### Load classified data
 meadowFiles <- list.files("data//snowClass//", pattern=".csv", full.names=T)
 trainData <- data.frame()
@@ -104,13 +108,13 @@ plotRGB(snowMeadow)
 plot(landCover, col=c("green","grey50","white"))
 
 ## Determine percent cover of snow
-length(landCover[landCover==3])/sum(
+length(landCover[landCover==3])/sum( ## Percent snow cover = snow pixels / (snow pixels + bare ground pixels)
 length(landCover[landCover==2]),
 length(landCover[landCover==3]))
+```
 
-
-### Model validation for snow
-
+### Model validation for snow only
+``` {r warning=FALSE, message=FALSE}
 ## create snow vs no snow
 trainData[,"snowPA"] <- ifelse(trainData$class=="snow",1,0)
 colnames(trainData)[3:5] <- c("Red","Green","Blue") ## revise names to RGB
@@ -130,11 +134,11 @@ trainAll <- rbind(occtrain.p,occtrain.a)
 testAll <- rbind(occtest.p,occtest.a)
 
 ## Evaluate the random forest
-rf1 <- randomForest(snowPA ~ Red + Green + Blue, data=trainAll, importance=T)
-rf1
-varImpPlot(rf1)
+rf2 <- randomForest(snowPA ~ Red + Green + Blue, data=trainAll, importance=T)
+rf2
+varImpPlot(rf2)
 
-eval1 <- evaluate(occtest.p, occtest.a, rf1)
+eval1 <- evaluate(occtest.p, occtest.a, rf2)
 eval1
 eval1@pcor
 
@@ -143,60 +147,63 @@ specSens <- threshold(eval1, stat="spec_sens")
 specSens
 
 ## confusion matrix
-predictTest <- ifelse(predict(rf1, newdata =testAll)>specSens, 1,0)
+predictTest <- ifelse(predict(rf2, newdata =testAll)>specSens, 1,0)
 
 conTable <- table(predicted = predictTest, observed = testAll$snowPA)
 conTable
 accuracy <- sum(diag(conTable))/nrow(testAll)
 accuracy
+```
 
 
-### Add in HSV values to models
+### Compare estimated percentages with visual and snow pillow
+```{r warning=FALSE, message=FALSE}
+## Rename raster
+names(snow) <-  c("Red","Green","Blue") ## revise names to RGB
 
-### Convert additional HSV
-rgbTohsv <- function(x){
-  r <- values(x[[1]])
-  g <- values(x[[2]])
-  b <- values(x[[2]])
-  hsv <- data.frame(t(rgb2hsv(r, g, b)))
-  return(hsv)
+## set up Random forest
+rf1 <- randomForest(class ~ Red + Green + Blue, data=trainAll, importance=T)
+rf1
+
+## Extract meadow cover for each meadow
+getSnow <- function(j){
+  meadowTemp <- crop(snow, j)  ## mask meadow from larger image
+  meadowTemp <- mask(meadowTemp, j)
+  meadowSnow <- predict(meadowTemp, rf1)
+  ## Determine percent cover of snow
+  snowPer <- freq(meadowSnow, value=3)/(freq(meadowSnow, value=3) + freq(meadowSnow, value=2)) ## snow / (snow+rock) i.e. omit forest
+  return(snowPer)
 }
-snow2 <- rgbTohsv(snow)
-hsvSnow <- snow
-hsvSnow[[1]] <- snow2[,"h"]
-hsvSnow[[2]] <- snow2[,"s"]
-hsvSnow[[3]] <- snow2[,"v"]
-hsvSnow
 
-coordinates(trainData) <- ~x+y
-crs(trainData) <- crs(snow)
+## Snow percent
+library(foreach)
+library(doParallel)
 
-## Extract HSV values
-hsvValues <- extract(hsvSnow, trainData)
-rgbhsv <- cbind(trainData, hsvValues)
-names(rgbhsv) <- c("R","G","B","Class","snowPA","H","S","V")
+cl <- makeCluster(6, type="PSOCK")
+registerDoParallel(cores = cl)
+meadowCover <- foreach(j = 1:17, .combine=c, .packages=c("raster","rgdal","randomForest")) %dopar% {
+  getSnow(buffMeadow[buffMeadow$meadow == meadowList[j],])
+}
 
-# write.csv(rgbhsv, "data//Classifiedrgbhsv.csv", row.names=FALSE)
+## Snow cover
+estSnow <- data.frame(year = 2012,  meadow = meadowList, snowCover=meadowCover)
 
-## New random forest
-rf2 <- randomForest(Class ~ R + G + B + H + S + V, data=rgbhsv, importance=T)
-rf2
+## Compare with visual data
 
-## Select submeadow 
-bothRas <- stack(snow, hsvSnow)
-names(bothRas) <- c("R","G","B","H","S","V")
-i <- 3
-meadowList[i]
-snowMeadow2 <- crop(bothRas, buffMeadow[buffMeadow$meadow == meadowList[i],])
-snowMeadow2 <- mask(snowMeadow2, buffMeadow[buffMeadow$meadow == meadowList[i],])
+## Load visual data
+Tempdata <- read.csv("data//snowData.csv", stringsAsFactors = F)
+visual2012 <- Tempdata  %>% filter(year==2012) %>% select(meadow, percent) 
+visual2012[visual2012$meadow=="g1","meadow"] <- "littleg"
 
+## Join with modelled cover
+bothEstimates <- merge(estSnow, visual2012, by="meadow")
 
-## Predict the land cover based on random forest
-landCover <- predict(snowMeadow2, rf2)
+## determine correlation
+corVal <- cor(bothEstimates$snowCover, bothEstimates$percent)
+corVal
 
-## Plot output with map
-par(mfrow=c(1,2))
-plotRGB(snowMeadow2)
-plot(landCover, col=c("green","grey50","white"))
+## Plot patterns
+ggplot(bothEstimates, aes(x=snowCover*100, y=percent)) + geom_point(size=3) + theme_Publication() + xlab("Random forest predicted snow cover (%)") + ylab("Visual estimate snow cover (%)") + annotate("text", x = 55, y = 95, label = "Meadows in 2012", size=8, hjust = 0) + annotate("text", x = 55, y = 90, label = paste0("cor = ",round(corVal,2)), size=6, hjust = 0) 
+
 ```
 
